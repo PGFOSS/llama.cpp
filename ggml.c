@@ -445,6 +445,30 @@ static inline __m128i packNibbles( __m256i bytes )
 }
 #endif
 
+#if __AVX512F__
+static inline __m512i bytesFromNibbles_256x2( const uint8_t* rsi_0, const uint8_t* rsi_1)
+{
+    // Load 32 bytes from memory
+//    __m256i tmp = _mm256_loadu2_m128i((__m128i *) rsi_0, (__m128i *) rsi_1);
+//    TODO: this is faster than the native instruction on zen4? something funky is going on
+    __m128i tmp_0 = _mm_loadu_si128( ( const __m128i* )rsi_0 );
+    __m128i tmp_1 = _mm_loadu_si128( ( const __m128i* )rsi_1 );
+    __m256i tmp = _mm256_set_m128i(tmp_0,tmp_1);
+
+    // Expand bytes into uint16_t values
+    __m512i bytes = _mm512_cvtepu8_epi16( tmp );
+
+    // Unpack values into individual bytes
+    const __m512i lowMask = _mm512_set1_epi8( 0xF );
+    __m512i high = _mm512_andnot_si512( lowMask, bytes );
+    __m512i low = _mm512_and_si512( lowMask, bytes );
+    high = _mm512_slli_epi16( high, 4 );
+    bytes = _mm512_or_si512( low, high );
+    return bytes;
+}
+
+#endif
+
 // method 5
 // blocks of QK elements
 // represented with a single float (delta) and QK/2 8-bit ints (i.e QK 4-bit signed integer factors)
@@ -1476,6 +1500,63 @@ inline static void ggml_vec_dot_f32(const int n, float * restrict s, const float
     *s = sumf;
 }
 
+#if __AVX512VNNI__ && QK == 32
+static inline __m512 dot_q4_0_twoblock_avx512vnni(
+    __m512 acc,
+    const uint8_t * pd0,
+    const uint8_t * pd1,
+    const uint8_t * pb0,
+    const uint8_t * pb1,
+    size_t bs,
+    int i
+) {
+    // get two blocks
+    const float * mat0_block0_scale = (const float *) (pd0 + (i+0)*bs);
+    const float * mat0_block1_scale = (const float *) (pd0 + (i+1)*bs);
+    const float * mat1_block0_scale = (const float *) (pd1 + (i+0)*bs);
+    const float * mat1_block1_scale = (const float *) (pd1 + (i+1)*bs);
+
+    const uint8_t * restrict mat0_block0 = pb0 + (i+0)*bs;
+    const uint8_t * restrict mat0_block1 = pb0 + (i+1)*bs;
+    const uint8_t * restrict mat1_block0 = pb1 + (i+0)*bs;
+    const uint8_t * restrict mat1_block1 = pb1 + (i+1)*bs;
+
+    // Compute combined scale for the blocks
+    float scaleScalar_0 = mat0_block0_scale[0] * mat1_block0_scale[0];
+    float scaleScalar_1 = mat0_block1_scale[0] * mat1_block1_scale[0];
+    // high half is block 0, low half is block 1
+    __m512 scale = _mm512_set_ps(scaleScalar_0,scaleScalar_0,scaleScalar_0,scaleScalar_0,
+                                 scaleScalar_0,scaleScalar_0,scaleScalar_0,scaleScalar_0,
+                                 scaleScalar_1,scaleScalar_1,scaleScalar_1,scaleScalar_1,
+                                 scaleScalar_1,scaleScalar_1,scaleScalar_1,scaleScalar_1);
+    //extract nibbles
+
+    __m512i bx = bytesFromNibbles_256x2(mat0_block0, mat0_block1);
+    __m512i by = bytesFromNibbles_256x2(mat1_block0, mat1_block1);
+    // vnni instruction VPDPBUSD: multiply packed 8-bit unsigned x with signed y and add 32-bit C
+    // get an expression in terms of a signed and unsigned number:
+    //   -->[(x0-8)(y0-8)+(x1-8)(y1-8)+(x2-8)(y2-8)+(x3-8)(y3-8)]
+    //        =[x0(y0-8) + x1(y1-8) +x2(y2-8)+x3(y3-8)] - 8 * [y0+y1+y3+y4] + 4*64
+    // the [x0(y0-8) + ...] term can be computed with VPDPBUSD
+    //   VPDPBUSD(256,x,y-8) = x0(y0-8)+x1(y1-8)...+256
+    // same for 8(y0+y1+y2+y3)
+    //   VPDPBUSD(Z,y,-8) = Z + (-8)*(y0+y1+y2+y3)
+    // put them together and...
+    // VPDPBUSD(VPDPBUSD(256,x,y-8), y, -8)=
+    //    x0(y0-8)+x1(y1-8)+x2(y2-8)+x3(x3-8) + 256 -8(y0+y1+y2+y3)
+    //    = (x0-8)(y0-8)+(x1-8)(y1-8)+(x2-8)(y2-8)+(x3-8)(y3-8)
+    const __m512i off_8 = _mm512_set1_epi8( -8 );
+    const __m512i off_256 = _mm512_set1_epi32( 256 );
+
+    __m512i sumi32 = _mm512_dpbusd_epi32(off_256,bx,_mm512_add_epi8(by,off_8));
+    sumi32 = _mm512_dpbusd_epi32(sumi32,by,off_8);
+
+    // Convert int32_t to float
+    __m512 p = _mm512_cvtepi32_ps( sumi32 );
+
+    return _mm512_fmadd_ps( scale, p, acc );
+}
+#endif
 #if __AVX512F__ && QK == 32
 static inline __m512 dot_q4_0_oneblock_avx512(
     __m512 acc,
@@ -1668,6 +1749,27 @@ inline static void ggml_vec_dot_q4_0(const int n, float * restrict s, const void
     }
 
     sumf = sum0 + sum1;
+#elif defined(__AVX512VNNI__)
+    const int superblock_size = 8;
+    const int superblock_count = nb / superblock_size;
+    const int remainder = nb % superblock_size;
+
+    __m512 acc = _mm512_setzero_ps();
+
+    for (int superblock_ix = 0; superblock_ix < superblock_count; superblock_ix += 1) {
+        for(int blk = 0; blk < superblock_size; blk+=2){
+            int i = superblock_ix * superblock_size + blk;
+            acc = dot_q4_0_twoblock_avx512vnni(acc, pd0, pd1, pb0, pb1, bs, i);
+        }
+    }
+
+    // Remainders
+    for (int i = superblock_count * superblock_size; i < nb; ++i) {
+        acc = dot_q4_0_oneblock_avx512( acc, pd0, pd1, pb0, pb1, bs, i );
+    }
+
+    // Horizontal sum of all lanes of the accumulator
+    sumf = _mm512_reduce_add_ps( acc );
 #elif defined(__AVX512F__)
     // Initialize accumulator with zeros
     __m512 acc0 = _mm512_setzero_ps();
@@ -10431,6 +10533,15 @@ int ggml_cpu_has_avx512(void) {
     return 0;
 #endif
 }
+
+int ggml_cpu_has_avx512vnni(void) {
+#if defined(__AVX512VNNI__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 
 int ggml_cpu_has_fma(void) {
 #if defined(__FMA__)

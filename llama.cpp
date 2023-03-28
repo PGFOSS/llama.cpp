@@ -1851,6 +1851,7 @@ const char * llama_print_system_info(void) {
     s += "AVX = "       + std::to_string(ggml_cpu_has_avx())       + " | ";
     s += "AVX2 = "      + std::to_string(ggml_cpu_has_avx2())      + " | ";
     s += "AVX512 = "    + std::to_string(ggml_cpu_has_avx512())    + " | ";
+    s += "AVX512VNNI = "+ std::to_string(ggml_cpu_has_avx512vnni())+ " | ";
     s += "FMA = "       + std::to_string(ggml_cpu_has_fma())       + " | ";
     s += "NEON = "      + std::to_string(ggml_cpu_has_neon())      + " | ";
     s += "ARM_FMA = "   + std::to_string(ggml_cpu_has_arm_fma())   + " | ";

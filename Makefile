@@ -132,6 +132,10 @@ ifeq ($(UNAME_M),$(filter $(UNAME_M),x86_64 i686))
 		ifneq (,$(findstring avx512pf,$(AVX512PF_M)))
 			CFLAGS += -mavx512pf
 		endif
+		AVX512_VNNI := $(shell grep "avx512_vnni " /proc/cpuinfo)
+		ifneq (,$(findstring avx512_vnni,$(AVX512_VNNI)))
+			CFLAGS += -mavx512vnni
+		endif
 	else ifeq ($(UNAME_S),Haiku)
 		AVX1_M := $(shell sysinfo -cpu | grep -w "AVX")
 		ifneq (,$(findstring AVX,$(AVX1_M)))
